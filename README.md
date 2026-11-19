@@ -23,7 +23,7 @@ result = (vehicles
 
 ## Quickstart
 
-Chainindent requires Python 3.14 or newer and has no runtime dependencies.
+Chainindent requires Python 3.12 or newer and has no runtime dependencies.
 The commands below use uv.
 
 To preview the changes to a local Python file, run Chainindent from GitHub
