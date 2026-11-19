@@ -10,6 +10,7 @@ from difflib import SequenceMatcher
 from typing import Any
 
 from .bindings import Bindings
+from .edits import apply_edits
 from .formatter import Settings, format_python
 
 
@@ -41,11 +42,12 @@ def prompted(code: str) -> str:
     return "".join(result)
 
 
-def format_prompt_group(lines: list[str], indent: str, settings: Settings, bindings: Bindings) -> list[str]:
+def format_prompt_group(
+    lines: list[str], code_lines: list[str], indent: str, settings: Settings, bindings: Bindings
+) -> list[str]:
     """Reformat a contiguous input block and retain its explicit console terminator."""
     terminator = lines[-1].strip() == "..."
-    inputs = lines[:-1] if terminator else lines
-    plain = "".join(PROMPT.sub("", line, count=1) for line in inputs)
+    plain = "".join(code_lines[:-1] if terminator else code_lines)
     updated = format_python(plain, settings, bindings=bindings)
     if updated == plain:
         return lines
@@ -72,26 +74,31 @@ def format_transcript(text: str, settings: Settings, bindings: Bindings | None =
         indent = match["indent"]
         start = index
         starts = []
+        code_lines = []
         pending_comment = False
         while index < len(lines):
             match = PROMPT.match(lines[index])
             if not match or match["indent"] != indent:
                 break
+            code_line = lines[index][match.end():]
             if match["marker"] == ">>>":
                 if not pending_comment:
-                    starts.append(index)
-                pending_comment = lines[index][match.end():].startswith("#")
+                    starts.append(index - start)
+                pending_comment = code_line.startswith("#")
+            code_lines.append(code_line)
             index += 1
-        updated = format_prompt_group(lines[start:index], indent, settings, context)
-        if updated == lines[start:index] and len(starts) > 1:
-            plain = "".join(PROMPT.sub("", line, count=1) for line in lines[start:index])
+        prompt_lines = lines[start:index]
+        updated = format_prompt_group(prompt_lines, code_lines, indent, settings, context)
+        if updated is prompt_lines and len(starts) > 1:
             try:
-                ast.parse(plain)
+                ast.parse("".join(code_lines))
             except SyntaxError:
                 # An incomplete example should not stop adjacent prompted examples.
-                ends = [*starts[1:], index]
+                ends = [*starts[1:], len(prompt_lines)]
                 updated = [line for left, right in zip(starts, ends, strict=True)
-                           for line in format_prompt_group(lines[left:right], indent, settings, context)]
+                           for line in format_prompt_group(
+                               prompt_lines[left:right], code_lines[left:right], indent, settings, context
+                           )]
         result.extend(updated)
     return "".join(result)
 
@@ -287,9 +294,7 @@ def format_notebook(text: str, settings: Settings) -> str:
             edits.append((source_start, source_end, json_source(
                 text, source_start, source_end, previous, formatted
             )))
-    for start, end, replacement in reversed(edits):
-        text = text[:start] + replacement + text[end:]
-    return text
+    return apply_edits(text, reversed(edits))
 
 
 def format_document(text: str, suffix: str, settings: Settings = Settings()) -> str:

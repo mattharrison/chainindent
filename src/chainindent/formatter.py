@@ -9,7 +9,8 @@ from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
-from .bindings import BindingAnalysis, Bindings
+from .bindings import BindingAnalysis, Bindings, LibraryMember
+from .edits import Edit, apply_edits
 
 
 @dataclass(frozen=True)
@@ -84,6 +85,20 @@ class Step:
     accessor: bool
 
 
+def wrap_single_step(step: Step) -> bool:
+    """Apply the column layout rules to a chain with just one step."""
+    if step.name in {"assign", "with_columns", "with_columns_seq"}:
+        return True
+    if not isinstance(step.node, ast.Call):
+        return False
+    if step.name in {"select", "select_seq"}:
+        return bool(step.node.keywords) or any(
+            not (isinstance(arg, ast.Constant) and isinstance(arg.value, str))
+            for arg in step.node.args
+        )
+    return step.name in {"agg", "aggregate"} and len(step.node.keywords) > 1
+
+
 @dataclass(frozen=True)
 class DictItem:
     """Dictionary entry and its span, including the key or unpacking marker."""
@@ -96,8 +111,17 @@ class DictItem:
 type RenderNode = ast.expr | ast.keyword | DictItem
 type ArgumentContainer = ast.Call | ast.List | ast.Set | ast.Tuple | ast.Dict | ast.Subscript
 type Span = tuple[int, int]
-type Edit = tuple[int, int, str]
-type ArgumentPart = tuple[RenderNode, int, int, list[Token], list[Token], bool]
+
+
+@dataclass(frozen=True)
+class ArgumentPart:
+    """The value, punctuation, and comments attached to one argument."""
+
+    node: RenderNode
+    span: Span
+    leading_comments: list[Token]
+    trailing_comments: list[Token]
+    had_comma: bool
 
 
 class Source:
@@ -191,30 +215,11 @@ class Formatter:
         self.parents = {child: parent for parent in ast.walk(tree)
                         for child in ast.iter_child_nodes(parent)}
         context = bindings if bindings is not None else Bindings()
-        self.modules = context.modules.copy()
-        self.factories = context.imports.copy()
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    if alias.name in {"pandas", "polars"}:
-                        self.modules[alias.asname or alias.name] = alias.name
-            if isinstance(node, ast.ImportFrom) and node.module in {"pandas", "polars"}:
-                for alias in node.names:
-                    self.factories[alias.asname or alias.name] = (node.module, alias.name)
         self.analysis = BindingAnalysis(context, EXPR_FACTORIES)
         self.analysis.visit(tree)
 
-    def factory(self, node: ast.expr) -> tuple[str, str] | None:
-        if not isinstance(node, ast.Call):
-            return None
-        func = node.func
-        if isinstance(func, ast.Name):
-            return self.factories.get(func.id)
-        if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
-            module = self.modules.get(func.value.id)
-            if module:
-                return module, func.attr
-        return None
+    def factory(self, node: ast.AST) -> LibraryMember | None:
+        return self.analysis.factories.get(node) if isinstance(node, ast.Call) else None
 
     def chain(self, node: ast.expr) -> tuple[ast.expr, list[Step]]:
         """Split dotted operations from their receiver without splitting accessors like .str."""
@@ -248,7 +253,7 @@ class Formatter:
         return current, list(reversed(steps))
 
     def expression_factory(self, node: ast.AST) -> bool:
-        factory = self.factory(node) if isinstance(node, ast.expr) else None
+        factory = self.factory(node)
         return factory is not None and (factory == ("pandas", "col") or (
             factory[0] == "polars" and factory[1] in EXPR_FACTORIES
         ))
@@ -287,18 +292,7 @@ class Formatter:
         ):
             return "expression"
         if len(steps) == 1:
-            if names[0] in {"assign", "with_columns", "with_columns_seq"}:
-                return "frame"
-            keywords = len(node.keywords) if isinstance(node, ast.Call) else 0
-            if isinstance(node, ast.Call) and names[0] in {"select", "select_seq"}:
-                if keywords or any(
-                    not (isinstance(arg, ast.Constant) and isinstance(arg.value, str))
-                    for arg in node.args
-                ):
-                    return "frame"
-            if names[0] in {"agg", "aggregate"} and keywords > 1:
-                return "frame"
-            return None
+            return "frame" if wrap_single_step(steps[0]) else None
         if isinstance(base, (ast.Constant, ast.Dict, ast.List, ast.Set, ast.Tuple)):
             return None
         if isinstance(base, ast.Call) and isinstance(base.func, ast.Name):
@@ -424,9 +418,23 @@ class Formatter:
         return text
 
     def argument_parts(
-        self, nodes: Sequence[RenderNode], opener: Token, closer: Token
-    ) -> tuple[list[ArgumentPart], list[Token]] | None:
+        self, container: ArgumentContainer, opener: Token, closer: Token
+    ) -> tuple[list[ArgumentPart], list[Token], bool] | None:
         """Associate arguments with comments and commas from their source spans."""
+        nodes: Sequence[RenderNode]
+        tuple_items = isinstance(container, ast.Tuple)
+        if isinstance(container, ast.Call):
+            nodes = sorted([*container.args, *container.keywords], key=lambda arg: self.source.span(arg)[0])
+        elif isinstance(container, ast.Dict):
+            nodes = list(self.dictionary_items(container, opener, closer))
+        elif isinstance(container, ast.Subscript):
+            first = self.source.after(opener.end)
+            tuple_items = isinstance(container.slice, ast.Tuple) and bool(
+                first and self.source.pairs.get(first.start) != self.source.before(closer.start)
+            )
+            nodes = container.slice.elts if tuple_items and isinstance(container.slice, ast.Tuple) else [container.slice]
+        else:
+            nodes = container.elts
         result: list[ArgumentPart] = []
         end = opener.end
         for index, node in enumerate(nodes):
@@ -443,9 +451,9 @@ class Formatter:
                     break
                 trailing.append(comment)
                 limit = comment.end
-            result.append((node, start, stop, self.comments(end, start), trailing, bool(comma)))
+            result.append(ArgumentPart(node, (start, stop), self.comments(end, start), trailing, bool(comma)))
             end = limit
-        return result, self.comments(end, closer.start)
+        return result, self.comments(end, closer.start), tuple_items
 
     def infix(
         self, node: ast.BinOp | ast.BoolOp | ast.Compare, prefix: str, indent: str, reserve: int
@@ -560,100 +568,79 @@ class Formatter:
         reserve: int = 0,
     ) -> str:
         """Pack arguments while budgeting space for punctuation added by callers."""
-        nodes: Sequence[RenderNode]
-        tuple_items = isinstance(node, ast.Tuple)
-        if isinstance(node, ast.Call):
-            nodes = sorted([*node.args, *node.keywords], key=lambda arg: self.source.span(arg)[0])
-        elif isinstance(node, ast.Dict):
-            nodes = list(self.dictionary_items(node, opener, closer))
-        elif isinstance(node, ast.Subscript):
-            first = self.source.after(opener.end)
-            tuple_items = isinstance(node.slice, ast.Tuple) and bool(
-                first and self.source.pairs.get(first.start) != self.source.before(closer.start)
-            )
-            nodes = node.slice.elts if tuple_items and isinstance(node.slice, ast.Tuple) else [node.slice]
-        else:
-            nodes = node.elts
-        parts = self.argument_parts(nodes, opener, closer)
+        parts = self.argument_parts(node, opener, closer)
         if parts is None:
             return prefix + self.source.code[opener.end:closer.end]
-        args, ending = parts
-        keywords = sum(isinstance(arg, ast.keyword) for arg in nodes)
+        args, ending, tuple_items = parts
+        keywords = sum(isinstance(part.node, ast.keyword) for part in args)
         column_layout = (method in COLUMN_METHODS and keywords > 0) or (
             method in {"agg", "aggregate"} and keywords > 1
         )
         item_indent = indent + self.space
         if self.settings.align_continuations and not column_layout:
             item_indent = " " * len(prefix.rsplit("\n", 1)[-1].expandtabs(8))
-        host_chain = len(nodes) == 1 and not isinstance(nodes[0], ast.keyword) and self.kind(nodes[0]) == "frame"
+        host_chain = len(args) == 1 and self.kind(args[0].node) == "frame"
+        closer_width = len(closer.text) + reserve
         text = prefix
         wrapped = False
         force_break = False
-        for index, (arg, start, end, leading, trailing, comma) in enumerate(args):
-            for comment in leading:
-                if index == 0 and "\n" not in self.source.code[opener.end:comment.start]:
+        for index, part in enumerate(args):
+            first = index == 0
+            last = index == len(args) - 1
+            arg = part.node
+            trailing = part.trailing_comments
+            for comment in part.leading_comments:
+                if first and "\n" not in self.source.code[opener.end:comment.start]:
                     text += "  " + comment.text
                 else:
                     text += "\n" + item_indent + comment.text
                 force_break = True
             named = column_layout and isinstance(arg, ast.keyword)
-            suffix = "," if index < len(args) - 1 or (comma and trailing) or (
-                tuple_items and len(nodes) == 1
-            ) else ""
-            inline = self.inline(start, end)
-            separator = "" if index == 0 else " "
+            comma = not last or (part.had_comma and bool(trailing)) or (tuple_items and first)
+            suffix = "," if comma else ""
             subject = arg.value if isinstance(arg, ast.keyword) else arg
             frame = self.kind(subject) == "frame"
-            tail = len(suffix)
-            if index == len(args) - 1 and not (ending or frame):
-                tail += len(closer.text) + reserve
-            item_start = len(text)
-            if frame and index == 0 and not force_break and not named:
-                text = self.value(arg, text, indent, span=(start, end), reserve=tail)
-                wrapped = "\n" in text[len(prefix):]
-            elif (not named and not force_break and not frame and inline is not None
-                  and self.fits(text + separator + inline, tail)):
+            tail = len(suffix) + (closer_width if last and not (ending or frame) else 0)
+
+            may_share_line = not (named or force_break)
+            separator = "" if first else " "
+            inline = self.inline(*part.span) if may_share_line and not frame else None
+            hanging = None
+            if inline is not None and self.fits(text + separator + inline, tail):
+                item_start = len(text) + len(separator)
                 text += separator + inline
-                item_start += len(separator)
             else:
-                # Keep the first argument beside the opener if it has internal break points.
-                can_hang = index == 0 and not named and not force_break
-                if can_hang:
-                    option = self.value(arg, text, indent, span=(start, end), reserve=tail)
-                    if "\n" in option[len(text):]:
-                        text = option
-                    else:
-                        can_hang = False
-                if not can_hang:
-                    item_start += 1 + len(item_indent)
-                    text += "\n" + self.value(
-                        arg, item_indent, item_indent, span=(start, end), reserve=tail
-                    )
-                wrapped = True
+                item_start = len(text)
+                if first and may_share_line:
+                    candidate = self.value(arg, text, indent, span=part.span, reserve=tail)
+                    if frame or "\n" in candidate[item_start:]:
+                        hanging = candidate
+                if (hanging is not None and frame and trailing and item_start == len(prefix)
+                        and not self.fits(hanging + suffix + "  " + trailing[0].text)
+                        and not self.comments(*part.span)):
+                    text += "\n" + item_indent + trailing[0].text
+                    trailing = trailing[1:]
+                    hanging = None
+                if hanging is not None:
+                    text = hanging
+                    wrapped |= "\n" in hanging[item_start:]
+                else:
+                    item_start = len(text) + 1 + len(item_indent)
+                    text += "\n" + self.value(arg, item_indent, item_indent, span=part.span, reserve=tail)
+                    wrapped = True
             text += suffix
             force_break = frame
-            if (frame and item_start == len(prefix) and trailing
-                    and not self.fits(text + "  " + trailing[0].text)
-                    and not self.comments(start, end)):
-                # Moving a hanging frame argument also moves its continuation indent.
-                text = (
-                    prefix + "\n" + item_indent + trailing[0].text + "\n"
-                    + self.value(arg, item_indent, item_indent, span=(start, end), reserve=tail) + suffix
-                )
-                trailing = trailing[1:]
-                wrapped = True
             for comment in trailing:
                 text = self.end_comment(text, comment, item_start, item_indent)
                 force_break |= text.endswith(comment.text)
-            if (trailing and not force_break and index == len(args) - 1
-                    and not tuple_items):
+            if trailing and not force_break and last and not tuple_items:
                 text = text.removesuffix(",")
         if ending:
             text += self.standalone_comments(ending, item_indent)
         if ending or (force_break and not host_chain) or (host_chain and wrapped and method is None) or (
             wrapped and self.settings.closing_paren_on_own_line
         ):
-            if args and args[-1][-1] and not force_break and not ending and not text.endswith(","):
+            if args and args[-1].had_comma and not force_break and not ending and not text.endswith(","):
                 text += ","
             return text + "\n" + indent + closer.text
         return text + closer.text
@@ -767,12 +754,7 @@ def format_python(code: str, settings: Settings = Settings(), *, bindings: Bindi
         except (SyntaxError, tokenize.TokenError):
             return False
 
-    candidate = code
-    last = len(code)
-    for start, end, replacement in edits:
-        if end <= last:
-            candidate = candidate[:start] + replacement + candidate[end:]
-            last = start
+    candidate = apply_edits(code, edits)
     if candidate == code or valid(candidate):
         return candidate
     # A complex surrounding construct can block one rewrite without blocking the file.

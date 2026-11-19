@@ -6,6 +6,7 @@ from typing import Literal
 
 
 type Kind = Literal["frame", "expression", "other"]
+type LibraryMember = tuple[str, str]
 
 FRAME_TYPES = {"DataFrame", "LazyFrame", "Series"}
 FRAME_FACTORIES = {
@@ -44,12 +45,29 @@ class Bindings:
     modules: dict[str, str] = field(default_factory=lambda: {
         "pd": "pandas", "pandas": "pandas", "pl": "polars", "polars": "polars",
     })
-    imports: dict[str, tuple[str, str]] = field(default_factory=dict)
+    imports: dict[str, LibraryMember] = field(default_factory=dict)
     functions: dict[str, Kind] = field(default_factory=dict)
 
     def copy(self) -> "Bindings":
         """Copy the visible state before visiting a nested scope."""
         return Bindings(self.values.copy(), self.modules.copy(), self.imports.copy(), self.functions.copy())
+
+    def forget(self, name: str) -> None:
+        """Remove previous facts when a name is rebound or shadowed."""
+        self.values.pop(name, None)
+        self.modules.pop(name, None)
+        self.imports.pop(name, None)
+        self.functions.pop(name, None)
+
+    def keep_shared(self, first: "Bindings", second: "Bindings") -> None:
+        """Retain facts that agree across two possible paths."""
+        def shared[T](left: dict[str, T], right: dict[str, T]) -> dict[str, T]:
+            return {key: value for key, value in left.items() if key in right and right[key] == value}
+
+        self.values = shared(first.values, second.values)
+        self.modules = shared(first.modules, second.modules)
+        self.imports = shared(first.imports, second.imports)
+        self.functions = shared(first.functions, second.functions)
 
 
 class BindingAnalysis(ast.NodeVisitor):
@@ -59,13 +77,14 @@ class BindingAnalysis(ast.NodeVisitor):
         self.bindings = bindings
         self.expression_factories = expression_factories
         self.facts: dict[ast.expr, Kind | None] = {}
+        self.factories: dict[ast.Call, LibraryMember] = {}
 
     def visit(self, node: ast.AST) -> None:
         super().visit(node)
         if isinstance(node, ast.expr):
             self.facts[node] = self.infer(node)
 
-    def member(self, node: ast.expr) -> tuple[str, str] | None:
+    def member(self, node: ast.expr) -> LibraryMember | None:
         if isinstance(node, ast.Name):
             return self.bindings.imports.get(node.id)
         if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
@@ -108,6 +127,7 @@ class BindingAnalysis(ast.NodeVisitor):
         if isinstance(node, ast.Call):
             func = node.func
             if member := self.member(func):
+                self.factories[node] = member
                 module, name = member
                 if (module == "polars" and name in self.expression_factories) or member == ("pandas", "col"):
                     return "expression"
@@ -139,25 +159,22 @@ class BindingAnalysis(ast.NodeVisitor):
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
             name = alias.asname or alias.name.split(".")[0]
+            self.bindings.forget(name)
             self.bindings.values[name] = "other" if alias.name in {"pandas", "polars"} else None
-            self.bindings.imports.pop(name, None)
-            self.bindings.modules.pop(name, None)
             if alias.name in {"pandas", "polars"}:
                 self.bindings.modules[name] = alias.name
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         for alias in node.names:
             name = alias.asname or alias.name
-            self.bindings.values[name] = None
-            self.bindings.modules.pop(name, None)
-            self.bindings.imports.pop(name, None)
+            self.bindings.forget(name)
             if node.module in {"pandas", "polars"}:
                 self.bindings.imports[name] = (node.module, alias.name)
 
     def bind(self, target: ast.expr, kind: Kind | None) -> None:
         if isinstance(target, ast.Name):
+            self.bindings.forget(target.id)
             self.bindings.values[target.id] = kind
-            self.bindings.functions.pop(target.id, None)
         elif isinstance(target, (ast.Tuple, ast.List)):
             for item in target.elts:
                 self.bind(item, None)
@@ -185,36 +202,41 @@ class BindingAnalysis(ast.NodeVisitor):
         self.bind(node.target, None)
 
     def visit_Delete(self, node: ast.Delete) -> None:
+        self.generic_visit(node)
         for target in node.targets:
             self.bind(target, None)
 
     def visit_FunctionDef(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        for decorator in node.decorator_list:
+            self.visit(decorator)
+        self.visit(node.args)
+        if node.returns is not None:
+            self.visit(node.returns)
+        args = [arg for arg in ast.iter_child_nodes(node.args) if isinstance(arg, ast.arg)]
+        parameters = [(arg.arg, self.annotation(arg.annotation)) for arg in args]
         enclosing = self.bindings
+        kind = self.annotation(node.returns)
+        enclosing.forget(node.name)
         enclosing.values[node.name] = "other"
-        enclosing.functions.pop(node.name, None)
-        if kind := self.annotation(node.returns):
+        if kind:
             enclosing.functions[node.name] = kind
-        inherited = enclosing.values.copy()
+        local = enclosing.copy()
         # A local assignment shadows the outer name even before it runs.
         pending: list[ast.AST] = list(node.body)
         while pending:
             statement = pending.pop()
             if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                inherited.pop(statement.name, None)
+                local.forget(statement.name)
                 continue
             if isinstance(statement, ast.Name) and isinstance(statement.ctx, (ast.Store, ast.Del)):
-                inherited.pop(statement.id, None)
+                local.forget(statement.id)
             if not isinstance(statement, (ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
                 pending.extend(ast.iter_child_nodes(statement))
-        self.bindings = enclosing.copy()
-        self.bindings.values = inherited
+        self.bindings = local
         try:
-            args = [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]
-            for arg in filter(None, (node.args.vararg, node.args.kwarg)):
-                args.append(arg)
-            for arg in args:
-                self.bindings.values[arg.arg] = self.annotation(arg.annotation)
-                self.bindings.functions.pop(arg.arg, None)
+            for name, kind in parameters:
+                self.bindings.forget(name)
+                self.bindings.values[name] = kind
             for statement in node.body:
                 self.visit(statement)
         finally:
@@ -228,8 +250,7 @@ class BindingAnalysis(ast.NodeVisitor):
         local = parent.copy()
         for arg in ast.iter_child_nodes(node.args):
             if isinstance(arg, ast.arg):
-                local.values[arg.arg] = None
-                local.functions.pop(arg.arg, None)
+                local.forget(arg.arg)
         self.bindings = local
         try:
             self.visit(node.body)
@@ -237,7 +258,10 @@ class BindingAnalysis(ast.NodeVisitor):
             self.bindings = parent
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        for header in [*node.decorator_list, *node.bases, *node.keywords]:
+            self.visit(header)
         enclosing = self.bindings
+        enclosing.forget(node.name)
         enclosing.values[node.name] = "other"
         self.bindings = enclosing.copy()
         try:
@@ -248,25 +272,25 @@ class BindingAnalysis(ast.NodeVisitor):
 
     def visit_If(self, node: ast.If) -> None:
         self.visit(node.test)
-        start = self.bindings.values.copy()
+        start = self.bindings
+        self.bindings = start.copy()
         for statement in node.body:
             self.visit(statement)
-        first = self.bindings.values
-        self.bindings.values = start.copy()
+        first = self.bindings
+        self.bindings = start.copy()
         for statement in node.orelse:
             self.visit(statement)
-        second = self.bindings.values
-        self.bindings.values = {name: first.get(name) if first.get(name) == second.get(name) else None
-                                for name in first.keys() | second.keys()}
+        start.keep_shared(first, self.bindings)
+        self.bindings = start
 
     def visit_For(self, node: ast.For | ast.AsyncFor) -> None:
         self.visit(node.iter)
-        start = self.bindings.values.copy()
+        start = self.bindings
+        self.bindings = start.copy()
         self.bind(node.target, None)
         for statement in [*node.body, *node.orelse]:
             self.visit(statement)
-        end = self.bindings.values
-        self.bindings.values = {name: start.get(name) if start.get(name) == end.get(name) else None
-                                for name in start.keys() | end.keys()}
+        start.keep_shared(start, self.bindings)
+        self.bindings = start
 
     visit_AsyncFor = visit_For

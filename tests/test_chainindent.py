@@ -568,3 +568,108 @@ def test_jupytext_tracks_bindings_without_using_markdown_examples():
     updated = format_document(source, ".py")
     assert "(df\n    .clone()\n    .clear()\n)" in updated
     assert format_document(updated, ".py") == updated
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        """\
+        def setup():
+            import polars as backend
+
+        backend = make_client()
+        backend.fetch().retry().close()
+        """,
+        """\
+        import polars as backend
+        backend = make_client()
+        backend.fetch().retry().close()
+        """,
+        """\
+        import polars as backend
+
+        def use_client(backend):
+            backend.fetch().retry().close()
+        """,
+        """\
+        if choice:
+            import polars as backend
+        else:
+            backend = make_client()
+
+        backend.fetch().retry().close()
+        """,
+    ],
+)
+def test_library_aliases_follow_python_binding_scope(assert_format, source):
+    assert_format(source, source)
+
+
+def test_function_default_keeps_its_enclosing_library_alias(assert_format):
+    source = """\
+        import polars as backend
+        def example(backend=backend.col('x').cast(int).sort()):
+            return backend
+        """
+    assert_format(source, source)
+
+
+@pytest.mark.parametrize(
+    ("original", "expected"),
+    [
+        pytest.param(
+            "print(df.join(other.select(pl.col('key')).unique(), on='key').head(3))\n",
+            """\
+            print(df
+                .join(other
+                    .select(pl.col('key'))
+                    .unique(),
+                    on='key')
+                .head(3)
+            )
+            """,
+            id="nested-frame",
+        ),
+        pytest.param(
+            "result = df.select(count=col.str.extract_all(pattern).list.len()).sort('count')\n",
+            """\
+            result = (df
+                .select(
+                    count=col.str.extract_all(pattern).list.len())
+                .sort('count')
+            )
+            """,
+            id="named-expression",
+        ),
+    ],
+)
+@pytest.mark.parametrize("document", ["python", "markdown", "console", "notebook"])
+def test_shared_layout_examples_across_input_formats(document, original, expected):
+    settings = Settings(line_length=70)
+    expected = dedent(expected)
+
+    def transcript(code):
+        first, *rest = code.splitlines(keepends=True)
+        return ">>> " + first + "".join("... " + line for line in rest)
+
+    if document == "markdown":
+        before = f"```python\n{original}```\n"
+        after = f"```python\n{expected}```\n"
+        suffix = ".md"
+    elif document == "console":
+        before = f"```pycon\n{transcript(original)}5 rows\n```\n"
+        after = f"```pycon\n{transcript(expected)}5 rows\n```\n"
+        suffix = ".md"
+    elif document == "notebook":
+        def notebook(source):
+            return json.dumps({"cells": [
+                {"cell_type": "code", "source": source, "outputs": [{"text": "5 rows"}]}
+            ]})
+
+        before, after = notebook(original), notebook(expected)
+        suffix = ".ipynb"
+    else:
+        before, after, suffix = original, expected, ".py"
+    assert ast.dump(ast.parse(original)) == ast.dump(ast.parse(expected))
+    assert format_document(before, suffix, settings) == after
+    assert format_document(after, suffix, settings) == after
