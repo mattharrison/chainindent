@@ -1,88 +1,153 @@
 # Chainindent
 
-Chainindent formats pandas and Polars chains in Python scripts, Markdown, and
-Jupyter notebooks.
+Chainindent formats pandas and Polars chains in Python, Markdown, and Jupyter
+notebooks. In a chain, each DataFrame operation starts on its own line.
+
+**Before**
+
+```python
+result = vehicles.sort('year').with_columns(city_mpg=pl.col('city08'), highway_mpg=pl.col('highway08')).select('year', 'city_mpg', 'highway_mpg')
+```
+
+**After**
 
 ```python
 result = (vehicles
-    .sort('year', descending=True)
+    .sort('year')
     .with_columns(
         city_mpg=pl.col('city08'),
         highway_mpg=pl.col('highway08'))
-    .select('year', 'make', 'city_mpg', 'highway_mpg')
+    .select('year', 'city_mpg', 'highway_mpg')
 )
 ```
 
-Each DataFrame step gets its own line. Named columns in `.assign()`,
-`.with_columns()`, and `.select()` start on separate lines. A single named
-aggregation can stay inline. Positional arguments, list items, and nested
-column expression calls share a line when they fit. Long indivisible terms
-can exceed the preferred line width.
+## Quickstart
 
-A standalone `.select()` can stay inline when its arguments are string
-literals. Keyword arguments, expressions, and other values trigger the
-indented chain layout.
+Chainindent requires Python 3.14 or newer and has no runtime dependencies.
+The commands below use uv.
 
-## Run it
-
-From the checkout:
+To preview the changes to a local Python file, run Chainindent from GitHub
+with `--diff`. The default command writes files in place.
 
 ```sh
-uv run chainindent example.py
-uv run chainindent --diff --line-length 73 chapter.ipynb
-uv run chainindent --check notes.md analysis.py
+uvx --from git+https://github.com/mattharrison/chainindent chainindent --diff analysis.py
 ```
 
-Install the checkout as an editable uv tool to run it from any directory.
-Edits to the checkout's Python source take effect on the next invocation.
+### Install a local checkout
+
+To run `chainindent` from any directory and pick up edits to your local
+checkout, install it in editable mode.
 
 ```sh
-uv tool install --editable /path/to/chainindent
-chainindent example.py
+git clone https://github.com/mattharrison/chainindent.git
+cd chainindent
+uv tool install --editable .
+chainindent --help
 ```
 
-uv exposes the command in its tool bin directory. Use `uv tool dir --bin`
-to see that directory and `uv tool update-shell` to add it to your PATH.
-For a one-off run from a checkout, use
-`uvx --from /path/to/chainindent chainindent example.py`.
+If your shell cannot find the command, run `uv tool update-shell` and open a
+new terminal. From the checkout, you can preview changes with
+`uv run chainindent --diff analysis.py`.
 
-The default command writes files in place. Pass `--diff` to preview changes
-or `--check` to exit with status 1 if files need formatting. Paths can be
-files or directories. Pass `-` to read from standard input and write the
-formatted result to standard output. `--stdin-filename chapter.md` selects
-the format and project settings for that input.
+## What gets formatted
 
-## Configure it
+A standalone `.select` call with string literals stays inline. Expressions
+and keyword arguments put the call in the chain layout. The `.assign` method
+puts each named column on a separate line.
 
-Set defaults in your project's `pyproject.toml` or override them with
-`--line-length`, `--indent-width`, `--align-continuations`, and
-`--closing-paren-on-own-line`.
+```python
+vehicles.select('year', 'city08')
+
+(vehicles
+    .select(pl.col('city08').mean())
+)
+
+(df
+    .assign(
+        revenue=lambda df: df['price'] * df['quantity'],
+        margin=lambda df: df['revenue'] - df['cost'])
+)
+```
+
+Positional arguments, list items, and nested expression calls can share a
+line when they fit. A single named aggregation can stay inline. An
+indivisible token such as a long string can exceed the preferred width.
+
+| File | Where Chainindent formats |
+| --- | --- |
+| Python (`.py`) | Python source and Python examples in Jupytext percent-format Markdown cells |
+| Markdown (`.md`, `.markdown`) | Fenced Python and PyCon examples |
+| Jupyter (`.ipynb`) | Python code cells, including PyCon input and supported cell magics such as `%%timeit`, plus Python and PyCon fences in Markdown cells |
+
+Chainindent uses assignments, type annotations, and earlier notebook cells
+to recognize DataFrames, LazyFrames, and Series. It also recognizes method
+patterns in standalone examples. It preserves notebook outputs and metadata,
+console output, and incomplete examples.
+
+## Configure line width and indentation
+
+The defaults are 80 columns and four spaces. For a book project that uses
+73 columns, add this to its `pyproject.toml`.
 
 ```toml
 [tool.chainindent]
-line-length = 80
-indent-width = 4
-align-continuations = false
-closing-paren-on-own-line = false
+line-length = 73
 ```
 
-Use `# chainindent: skip` immediately above a statement to preserve its
-formatting. This also works inside a Markdown code block or a notebook cell.
+Chainindent uses the nearest `[tool.chainindent]` table above each input.
+A command-line flag overrides the project setting for that run.
+
+```sh
+chainindent --diff --line-length 80 chapter.ipynb
+```
+
+The other settings are `indent-width`, `align-continuations`, and
+`closing-paren-on-own-line`. The last two default to `false` and have
+matching command-line flags.
+
+## Skip a teaching example
+
+Put `# chainindent: skip` immediately above a statement to preserve its
+layout. The directive also works inside a notebook cell or a fenced example.
 
 ```python
 # chainindent: skip
 result = vehicles.sort('year').head(5)
 ```
 
-Chainindent tracks DataFrame, LazyFrame, and Series bindings from recognized
-constructors, annotations, assignments, and earlier notebook cells. On a
-known receiver it can format a chain containing unfamiliar or custom methods.
-For standalone snippets whose receiver cannot be inferred, it looks for
-pandas and Polars method patterns. It supports fenced
-Python and PyCon blocks, Jupytext percent-format Markdown cells, and plain or
-prompted Python cells in notebooks. Python cell magics such as `%%timeit` can
-contain formatted Python, with the magic line preserved. Notebook outputs
-and metadata are preserved. Incomplete examples are left as written.
+## Use Chainindent with Ruff or Black
 
-Run the tests and docstring examples with `uv run pytest`. Check types with
-`uv run ty check`.
+When you want Chainindent's layout in the final file, run it after your
+general-purpose formatter.
+
+```sh
+uvx ruff format analysis.py
+chainindent analysis.py
+```
+
+## Check formatting in CI
+
+Chainindent accepts files and recursively scans directories for supported
+files. Use `--check` to test whether anything needs formatting.
+
+```sh
+chainindent --check chapters/
+```
+
+| Exit status | Meaning |
+| --- | --- |
+| `0` | The check passed |
+| `1` | At least one file would change |
+| `2` | The command encountered an error |
+
+For standard input, pass `-`. Use `--stdin-filename` to select the file format
+and locate the project configuration.
+
+## Development
+
+```sh
+uv run pytest
+uv run ty check
+```
+
+Pytest runs the regression suite and the docstring examples.
